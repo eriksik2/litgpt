@@ -1,0 +1,90 @@
+= model(input_ids, return_self_state=True)
+                ce_loss = chunked_cross_entropy(logits, targets)
+                with torch.no_grad():
+                    correct = (logits.argmax(dim=-1) == targets).to(dtype=logits.dtype)
+                correctness_logits = model.correctness_head(self_state).squeeze(-1)
+                aux_loss = torch.nn.functional.binary_cross_entropy_with_logits(correctness_logits, correct)
+                loss = ce_loss + aux_weight * aux_loss
+            else:
+                logits = model(input_ids)
+                loss = chunked_cross_entropy(logits, targets)
+                ce_loss = loss
+                aux_loss = None
+            fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
+
+        running_loss.update(loss.detach())
+
+        if not is_accumulating:
+            fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            state["step_count"] += 1
+
+        if state["iter_num"] % log_iter_interval == 0:
+            loss = running_loss.compute().item()  # expensive device-to-host synchronization
+            t1 = time.perf_counter()
+            throughput.update(
+                time=(t1 - total_t0),
+                flops=(measured_flops * log_iter_interval),
+                batches=state["iter_num"],
+                samples=(state["iter_num"] * train.micro_batch_size),
+                lengths=(state["iter_num"] * train.micro_batch_size * model.max_seq_length),
+            )
+            metrics = {
+                "loss": loss,
+                "iter": state["iter_num"],
+                "step": state["step_count"],
+                "epoch": train_iterator.epoch,
+                "iter_time": t1 - iter_t0,
+                "remaining_time": (
+                    (t1 - total_t0) / (state["iter_num"] - initial_iter) * (max_iters - state["iter_num"])
+                ),
+                "tokens": state["iter_num"] * train.micro_batch_size * model.max_seq_length,
+                "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
+                "learning_rate": lr,
+            }
+            if use_self_state_aux and aux_loss is not None:
+                metrics["ce_loss"] = ce_loss.detach().item()
+                metrics["aux_loss"] = aux_loss.detach().item()
+            if isinstance(val_loss, float):
+                val_loss = f"{val_loss:.3f}"
+            aux_msg = ""
+            if "aux_loss" in metrics:
+                aux_msg = f" ce: {metrics['ce_loss']:.3f}, aux: {metrics['aux_loss']:.3f},"
+            fabric.print(
+                f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
+                f" loss train: {metrics['loss']:.3f},{aux_msg}"
+                f" val: {val_loss} |"
+                f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
+                f"{' (step)' if not is_accumulating else ''}"
+                f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
+            )
+
+            throughput_metrics = throughput.compute()
+            metrics.update(throughput_metrics)
+            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+
+        if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
+            t0 = time.perf_counter()
+            val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+            val_loss = val_loss.item()
+            td = time.perf_counter() - t0
+
+            fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
+            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            fabric.barrier()
+
+        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+            save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+
+    # Final validation
+    if eval.final_validation:
+        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+        fabric.log_dict(metrics, step=state["iter_num"])
+        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+
+
+@torch.no_grad()
+def 

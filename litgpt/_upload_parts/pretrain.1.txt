@@ -1,0 +1,136 @@
+        tokenizer_dir = extend_checkpoint_dir(tokenizer_dir)
+
+    if model_config is None:
+        # Support both model_name options: meta-llama/Meta-Llama-3-8B & Meta-Llama-3-8B
+        try:
+            model_config = Config.from_name(model_name)
+        except ValueError:
+            print(f"Model name {model_name} is not supported.\n")
+            available_models = "\n".join(sorted(name_to_config))
+            print(f"Available values:\n{available_models}")
+            quit()
+
+    hparams = capture_hparams()
+    data = TinyLlama() if data is None else data
+
+    config = Config.from_name(model_name) if model_config is None else model_config
+    precision = precision or get_default_supported_precision(training=True)
+    devices = parse_devices(devices)
+    out_dir = init_out_dir(out_dir)
+    # in case the dataset requires the Tokenizer
+    tokenizer = Tokenizer(tokenizer_dir) if tokenizer_dir is not None else None
+
+    logger = choose_logger(
+        logger_name,
+        out_dir,
+        name=f"pretrain-{config.name}",
+        resume=bool(resume),
+        log_interval=train.log_interval,
+        log_args=asdict(log),
+    )
+
+    if devices * num_nodes > 1:
+        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    else:
+        strategy = "auto"
+
+    fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision=precision, loggers=[logger])
+
+    if torch.cuda.is_available() and devices > 1:
+        check_nvlink_connectivity(fabric)
+
+    fabric.launch()
+
+    fabric.print(pprint.pformat(hparams))
+    if logger_name in ("tensorboard", "wandb", "mlflow"):
+        fabric.logger.log_hyperparams(hparams)
+
+    main(
+        fabric=fabric,
+        devices=devices,
+        num_nodes=num_nodes,
+        seed=seed,
+        initial_checkpoint_dir=initial_checkpoint_dir,
+        resume=resume,
+        config=config,
+        data=data,
+        out_dir=out_dir,
+        tokenizer_dir=tokenizer_dir,
+        tokenizer=tokenizer,
+        train=train,
+        eval=eval,
+        optimizer=optimizer,
+    )
+
+
+def main(
+    fabric: L.Fabric,
+    devices: int,
+    seed: int,
+    initial_checkpoint_dir: Path | None,
+    resume: bool | Literal["auto"] | Path,
+    config: Config,
+    data: DataModule,
+    out_dir: Path,
+    tokenizer_dir: Path | None,
+    tokenizer: Tokenizer | None,
+    train: TrainArgs,
+    eval: EvalArgs,
+    optimizer: str | dict,
+    num_nodes: int = 1,
+) -> None:
+    validate_args(train, eval, initial_checkpoint_dir, resume)
+
+    if fabric.global_rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    fabric.seed_everything(seed)  # same seed for every process to init model (FSDP)
+
+    t0 = time.perf_counter()
+    with fabric.init_module(empty_init=True):
+        model = GPT(config)
+
+    initialize_weights(fabric, model, n_layer=config.n_layer, n_embd=config.n_embd)
+
+    if train.tie_embeddings:
+        model.transformer.wte.weight = model.lm_head.weight
+    if train.max_seq_length:
+        model.max_seq_length = train.max_seq_length
+
+    fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
+    fabric.print(f"Total parameters: {num_parameters(model):,}")
+
+    # Dynamic return of `(logits, self_state)` is poorly suited to torch.compile.
+    if config.self_state_dim <= 0:
+        model = torch.compile(model)
+    else:
+        fabric.print("Skipping torch.compile because self-state is enabled.")
+    model = fabric.setup(model)
+
+    extra_kwargs = {"fused": fabric.device.type == "cuda"}
+    optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
+    optimizer = fabric.setup_optimizers(optimizer)
+
+    train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
+    train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
+
+    if initial_checkpoint_dir:
+        fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
+
+    state = {
+        "model": model,
+        "optimizer": optimizer,
+        "train_dataloader": train_dataloader,
+        "iter_num": 0,
+        "step_count": 0,
+    }
+
+    resume = find_resume_path(resume, out_dir)
+    if resume:
+        fabric.print(f"Resuming training from {resume}")
+        fabric.load(resume, state)
+
+    train_time = time.perf_counter()
+
+    # work around PyTorch issue https://github.com/pytorch/pytorch/issues/152162
+    # which does not like the laz

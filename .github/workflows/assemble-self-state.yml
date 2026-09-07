@@ -1,0 +1,81 @@
+name: Assemble self-state sources
+on:
+  workflow_dispatch:
+  push:
+    branches: [cursor/self-state-vector-4798]
+    paths:
+      - "litgpt/_upload_parts/**"
+      - ".github/workflows/assemble-self-state.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/self-state-vector-4798
+          fetch-depth: 0
+      - name: Decode gzip+b64 payloads into Python sources
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib, json
+
+          parts_dir = Path("litgpt/_upload_parts")
+          mapping = {
+              "pretrain": Path("litgpt/pretrain.py"),
+              "model": Path("litgpt/model.py"),
+              "config": Path("litgpt/config.py"),
+          }
+
+          def load_b64(stem: str) -> str:
+              single = parts_dir / f"{stem}.py.gz.b64"
+              if single.exists():
+                  text = single.read_text().strip()
+              else:
+                  parts = sorted(parts_dir.glob(f"{stem}.py.gz.b64.*"))
+                  if not parts:
+                      raise SystemExit(f"missing payload for {stem}")
+                  text = "".join(p.read_text().strip() for p in parts)
+              patch_path = parts_dir / f"{stem}_b64_patches.json"
+              if patch_path.exists():
+                  patch_doc = json.loads(patch_path.read_text())
+                  chars = list(text)
+                  for p in patch_doc.get("patches", []):
+                      if chars[p["pos"]] != p["remote"]:
+                          raise SystemExit(f"patch mismatch at {p['pos']}: got {chars[p['pos']]!r} expected remote {p['remote']!r}")
+                      chars[p["pos"]] = p["local"]
+                  text = "".join(chars)
+                  print("applied patches", stem, len(patch_doc.get("patches", [])))
+              return text
+
+          expected = {}
+          meta_path = parts_dir / "expected_hashes.json"
+          if meta_path.exists():
+              expected = json.loads(meta_path.read_text())
+
+          for stem, dest in mapping.items():
+              b64 = load_b64(stem)
+              raw = gzip.decompress(base64.b64decode(b64))
+              dest.write_bytes(raw)
+              digest = hashlib.sha256(raw).hexdigest()
+              print(stem, "bytes", len(raw), "sha256", digest)
+              if stem in expected:
+                  assert digest == expected[stem]["raw_sha256"], (stem, digest, expected[stem])
+                  assert len(raw) == expected[stem]["raw_len"], stem
+                  print("verified", stem)
+          PY
+      - name: Commit assembled files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add litgpt/pretrain.py litgpt/model.py litgpt/config.py
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Wire gated self-state into GPT, config, and pretrain loss"
+            git push origin HEAD:cursor/self-state-vector-4798
+          fi

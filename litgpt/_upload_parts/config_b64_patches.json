@@ -1,0 +1,10 @@
+{
+  "file": "config.py.gz.b64",
+  "patches": [
+    {"pos": 949, "remote": "T", "local": "b"},
+    {"pos": 5205, "remote": "5", "local": "9"},
+    {"pos": 7217, "remote": "T", "local": "X"},
+    {"pos": 8878, "remote": "I", "local": "E"},
+    {"pos": 10358, "remote": "y", "local": "z"}
+  ]
+}

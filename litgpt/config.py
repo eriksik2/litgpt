@@ -114,6 +114,13 @@ class Config:
     # `rope_base` is used, for 1 `rope_local_base_freq` is used. If
     # `len(rope_indices) > n_layer`, we only use the initial part.
     rope_indices: list[int] | None = None
+    # Learned self-state vector (0 disables the mechanism). After each block,
+    # activations are encoded into a gated state that is projected back into
+    # the residual stream of the next block.
+    self_state_dim: int = 0
+    # Weight for the auxiliary BCE that predicts, from self_state, whether the
+    # model's current next-token prediction is correct. 0 disables the aux loss.
+    self_state_aux_loss_weight: float = 0.0
 
     def __post_init__(self):
         if not self.name:
@@ -3190,5 +3197,45 @@ r1_distill_llama = [
 ]
 
 configs.extend(r1_distill_llama)
+
+########################
+# Self-state experiment (~100M)
+########################
+self_state_configs = [
+    # ~100M decoder-only model with a 128-d gated self-state stream.
+    # Rough size: 12 layers × 640 d_model × 10 heads (Pythia-style norms/MLPs).
+    dict(
+        name="self-state-100m",
+        hf_config=dict(org="local", name="self-state-100m"),
+        block_size=2048,
+        vocab_size=50254,
+        padding_multiple=128,
+        n_layer=12,
+        n_embd=640,
+        n_head=10,
+        rotary_percentage=0.25,
+        parallel_residual=True,
+        bias=True,
+        self_state_dim=128,
+        self_state_aux_loss_weight=0.1,
+    ),
+    # Same architecture without self-state, for controlled ablations.
+    dict(
+        name="self-state-100m-baseline",
+        hf_config=dict(org="local", name="self-state-100m-baseline"),
+        block_size=2048,
+        vocab_size=50254,
+        padding_multiple=128,
+        n_layer=12,
+        n_embd=640,
+        n_head=10,
+        rotary_percentage=0.25,
+        parallel_residual=True,
+        bias=True,
+        self_state_dim=0,
+        self_state_aux_loss_weight=0.0,
+    ),
+]
+configs.extend(self_state_configs)
 
 name_to_config = {config["name"]: config for config in configs}

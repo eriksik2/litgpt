@@ -23,7 +23,7 @@ from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
 from litgpt.data import DataModule, TinyLlama
-from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP, SelfStateCell
 from litgpt.parser_config import save_hyperparameters
 from litgpt.types import LoggerChoice
 from litgpt.utils import (
@@ -210,7 +210,11 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
+    # Dynamic return of `(logits, self_state)` is poorly suited to torch.compile.
+    if config.self_state_dim <= 0:
+        model = torch.compile(model)
+    else:
+        fabric.print("Skipping torch.compile because self-state is enabled.")
     model = fabric.setup(model)
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
@@ -350,8 +354,21 @@ def fit(
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets)
+            aux_weight = getattr(model.config, "self_state_aux_loss_weight", 0.0) or 0.0
+            use_self_state_aux = model.config.self_state_dim > 0 and aux_weight > 0
+            if use_self_state_aux:
+                logits, self_state = model(input_ids, return_self_state=True)
+                ce_loss = chunked_cross_entropy(logits, targets)
+                with torch.no_grad():
+                    correct = (logits.argmax(dim=-1) == targets).to(dtype=logits.dtype)
+                correctness_logits = model.correctness_head(self_state).squeeze(-1)
+                aux_loss = torch.nn.functional.binary_cross_entropy_with_logits(correctness_logits, correct)
+                loss = ce_loss + aux_weight * aux_loss
+            else:
+                logits = model(input_ids)
+                loss = chunked_cross_entropy(logits, targets)
+                ce_loss = loss
+                aux_loss = None
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
@@ -385,11 +402,17 @@ def fit(
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
             }
+            if use_self_state_aux and aux_loss is not None:
+                metrics["ce_loss"] = ce_loss.detach().item()
+                metrics["aux_loss"] = aux_loss.detach().item()
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
+            aux_msg = ""
+            if "aux_loss" in metrics:
+                aux_msg = f" ce: {metrics['ce_loss']:.3f}, aux: {metrics['aux_loss']:.3f},"
             fabric.print(
                 f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
-                f" loss train: {metrics['loss']:.3f},"
+                f" loss train: {metrics['loss']:.3f},{aux_msg}"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
@@ -491,6 +514,14 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
     for mod in model.modules():
         if isinstance(mod, (LLaMAMLP, CausalSelfAttention)):
             mod.proj.reset_parameters = partial(init_weights, mod.proj, std=(1 / math.sqrt(n_embd) / n_layer))
+        if isinstance(mod, SelfStateCell):
+            # Keep residual injection at zero at init; re-apply after Linear monkey-patching.
+            def zero_proj(module: nn.Linear) -> None:
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+            mod.proj.reset_parameters = partial(zero_proj, mod.proj)
 
     if not isinstance(fabric.strategy, FSDPStrategy):
         reset_parameters(model)

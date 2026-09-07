@@ -1,0 +1,62 @@
+# Pretrain the ~100M self-state experiment model.
+# Core LM objective: next-token cross-entropy.
+# Auxiliary objective: from self_state, predict whether the current prediction is correct.
+#
+# Launch:
+#   litgpt pretrain --config config_hub/pretrain/self-state-100m.yaml
+#
+# Ablation (no self-state):
+#   litgpt pretrain --config config_hub/pretrain/self-state-100m-baseline.yaml
+
+model_name: self-state-100m
+
+model_config:
+
+out_dir: out/pretrain/self-state-100m
+
+precision: bf16-mixed
+
+initial_checkpoint_dir:
+
+resume: false
+
+# Replace with your packed token dataset module when scaling up.
+# TinyStories / OpenWebText-style modules from litgpt.data also work.
+data: TinyLlama
+
+train:
+  save_interval: 1000
+  log_interval: 1
+  global_batch_size: 64
+  micro_batch_size: 4
+  lr_warmup_steps: 100
+  epochs:
+  # Short default for smoke runs; raise for real experiments (e.g. 2e9–20e9).
+  max_tokens: 100000000
+  max_steps:
+  max_seq_length: 512
+  tie_embeddings: false
+  max_norm: 1.0
+  min_lr: 4.0e-05
+
+eval:
+  interval: 500
+  max_new_tokens:
+  max_iters: 50
+  initial_validation: false
+  final_validation: true
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 6.0e-4
+    weight_decay: 0.1
+    betas:
+      - 0.9
+      - 0.95
+
+devices: auto
+num_nodes: 1
+tokenizer_dir:
+logger_name: csv
+seed: 42
