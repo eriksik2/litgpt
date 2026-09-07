@@ -1,1 +1,123 @@
-# LOAD_FROM_DISK:/agent/litgpt/litgpt/pretrain.py
+# Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
+
+import math
+import pprint
+import time
+import warnings
+from dataclasses import asdict
+from datetime import timedelta
+from functools import partial
+from pathlib import Path
+from typing import Literal
+
+import lightning as L
+import torch
+import torch.nn as nn
+from lightning.fabric.strategies import FSDPStrategy
+from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flops
+from torch.utils.data import DataLoader
+from torchmetrics.aggregation import RunningMean
+
+from litgpt import Tokenizer
+from litgpt.args import EvalArgs, LogArgs, TrainArgs
+from litgpt.config import name_to_config
+from litgpt.constants import _TORCH_EQUAL_2_7, _TORCH_EQUAL_2_8
+from litgpt.data import DataModule, TinyLlama
+from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP, SelfStateCell
+from litgpt.parser_config import save_hyperparameters
+from litgpt.types import LoggerChoice
+from litgpt.utils import (
+    CycleIterator,
+    capture_hparams,
+    check_nvlink_connectivity,
+    choose_logger,
+    chunked_cross_entropy,
+    copy_config_files,
+    extend_checkpoint_dir,
+    find_resume_path,
+    get_default_supported_precision,
+    init_out_dir,
+    instantiate_torch_optimizer,
+    num_parameters,
+    parse_devices,
+    reset_parameters,
+    save_config,
+)
+
+
+def setup(
+    model_name: str,
+    model_config: Config | None = None,
+    out_dir: Path = Path("out/pretrain"),
+    precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
+    initial_checkpoint_dir: Path | None = None,
+    resume: bool | Literal["auto"] | Path = False,
+    data: DataModule | None = None,
+    train: TrainArgs = TrainArgs(
+        save_interval=1000,
+        log_interval=1,
+        global_batch_size=512,
+        micro_batch_size=4,
+        max_tokens=int(3e12),  # 3 trillion
+        max_norm=1.0,
+        min_lr=4e-5,
+        lr_warmup_steps=2000,
+        tie_embeddings=False,
+    ),
+    eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
+    log: LogArgs = LogArgs(),
+    optimizer: str | dict = "AdamW",
+    devices: int | str = "auto",
+    num_nodes: int = 1,
+    tokenizer_dir: Path | None = None,
+    logger_name: LoggerChoice = "tensorboard",
+    seed: int = 42,
+):
+    """Pretrain a model.
+
+    Arguments:
+        model_name: The name of the model to pretrain. Choose from names in ``litgpt.config``. Use "list" to list the supported models.
+        model_config: A ``litgpt.Config`` object to define the model architecture. Mutually exclusive with
+            ``model_config``. Overrides the `model_name` if specified.
+        out_dir: Directory in which to save checkpoints and logs. If running in a Lightning Studio Job, look for it in
+            /teamspace/jobs/<job-name>/share.
+        precision: The precision to use for finetuning. Determines a compatible precision setting by default.
+        initial_checkpoint_dir: Optional path to a checkpoint directory to initialize the model from.
+            Useful for continued pretraining. Mutually exclusive with ``resume``.
+        resume: Path to a checkpoint directory to resume from in case training was interrupted, or ``True`` to resume
+            from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
+            ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
+        data: Data-related arguments. If not provided, the default is ``litgpt.data.TinyLlama``.
+        train: Training-related arguments. See ``litgpt.args.TrainArgs`` for details.
+        eval: Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details.
+        optimizer: An optimizer name (such as "AdamW") or config.
+
+        devices: How many devices/GPUs to use. Uses all GPUs by default.
+        num_nodes: How many nodes the code is being run on.
+        tokenizer_dir: Optional path to the tokenizer dir that was used for preprocessing the dataset. Only some data
+            module require this.
+        logger_name: The name of the logger to send metrics to.
+        seed: The random seed to use for reproducibility.
+    """
+    if model_name == "list":
+        available_models = "\n".join(sorted(name_to_config))
+        print(f"Available values:\n{available_models}")
+        quit()
+
+    if initial_checkpoint_dir is not None:
+        initial_checkpoint_dir = extend_checkpoint_dir(initial_checkpoint_dir)
+
+    if tokenizer_dir is not None:
+        tokenizer_dir = extend_checkpoint_dir(tokenizer_dir)
+
+    if model_config is None:
+        # Support both model_name options: meta-llama/Meta-Llama-3-8B & Meta-Llama-3-8B
+        try:
+            model_config = Config.from_name(model_name)
+        except ValueError:
+            print(f"Model name {model_name} is not supported.\n")
+            available_models = "\n".join(sorted(name_to_config))
+            print(f"Available values:\n{available_models}")
+            quit()
+
+    hparams = 
