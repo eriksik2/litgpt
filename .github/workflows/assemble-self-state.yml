@@ -34,11 +34,23 @@ jobs:
           def load_b64(stem: str) -> str:
               single = parts_dir / f"{stem}.py.gz.b64"
               if single.exists():
-                  return single.read_text().strip()
-              parts = sorted(parts_dir.glob(f"{stem}.py.gz.b64.*"))
-              if not parts:
-                  raise SystemExit(f"missing payload for {stem}")
-              return "".join(p.read_text().strip() for p in parts)
+                  text = single.read_text().strip()
+              else:
+                  parts = sorted(parts_dir.glob(f"{stem}.py.gz.b64.*"))
+                  if not parts:
+                      raise SystemExit(f"missing payload for {stem}")
+                  text = "".join(p.read_text().strip() for p in parts)
+              patch_path = parts_dir / f"{stem}_b64_patches.json"
+              if patch_path.exists():
+                  patch_doc = json.loads(patch_path.read_text())
+                  chars = list(text)
+                  for p in patch_doc.get("patches", []):
+                      if chars[p["pos"]] != p["remote"]:
+                          raise SystemExit(f"patch mismatch at {p['pos']}: got {chars[p['pos']]!r} expected remote {p['remote']!r}")
+                      chars[p["pos"]] = p["local"]
+                  text = "".join(chars)
+                  print("applied patches", stem, len(patch_doc.get("patches", [])))
+              return text
 
           expected = {}
           meta_path = parts_dir / "expected_hashes.json"
