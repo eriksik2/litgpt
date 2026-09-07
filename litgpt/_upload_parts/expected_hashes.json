@@ -1,0 +1,14 @@
+{
+  "pretrain": {
+    "raw_sha256": "a555bcc4a07284cbe0e7f8237b62bf2a9b91425528296ed9fcd0ccfef50d6189",
+    "raw_len": 22853
+  },
+  "model": {
+    "raw_sha256": "2154c459a859b9e0ae761f21d2ccf46280fd5afe57ad4caba3b3856e0f031eb8",
+    "raw_len": 64584
+  },
+  "config": {
+    "raw_sha256": "e5cf12a3c192cf04b8903723feeb4ed11856927158eb73da43997fa2e3844914",
+    "raw_len": 101130
+  }
+}
