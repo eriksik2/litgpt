@@ -33,6 +33,13 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
+        self.self_state_cells: nn.ModuleList | None = None
+        self.correctness_head: nn.Linear | None = None
+        if config.self_state_dim > 0:
+            self.self_state_cells = nn.ModuleList(
+                SelfStateCell(config.n_embd, config.self_state_dim) for _ in range(config.n_layer)
+            )
+            self.correctness_head = nn.Linear(config.self_state_dim, 1)
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
 
@@ -88,7 +95,8 @@ class GPT(nn.Module):
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
-    ) -> torch.Tensor | list[torch.Tensor]:
+        return_self_state: bool = False,
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor | list[torch.Tensor], torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
         positions smaller than entries in `input_pos`. For efficiency, pass
@@ -109,12 +117,16 @@ class GPT(nn.Module):
             input_pos_maxp1: Optional. See above.
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            return_self_state: If True and `config.self_state_dim > 0`, also
+                return the final per-token self-state tensor of shape
+                `(B, T, self_state_dim)`.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
             `lm_head_chunk_size > 0`, this is a list of chunks of shape
             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
-            entry can be shorter.
+            entry can be shorter. When `return_self_state` is True, returns
+            `(logits, self_state)`.
 
         """
         T = idx.size(1)
@@ -156,7 +168,22 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
+        use_self_state = self.self_state_cells is not None
+        self_state = None
+        state_delta = None
+        if use_self_state:
+            self_state = torch.zeros(
+                x.size(0),
+                x.size(1),
+                self.config.self_state_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            state_delta = torch.zeros_like(x)
+
         for block_idx, block in enumerate(self.transformer.h):
+            if use_self_state:
+                x = x + state_delta
             if self.config.rope_indices is not None:
                 x = block(
                     x,
@@ -168,6 +195,9 @@ class GPT(nn.Module):
                 )
             else:
                 x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+            if use_self_state:
+                self_state, state_delta = self.self_state_cells[block_idx](x, self_state)
+
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -176,9 +206,17 @@ class GPT(nn.Module):
         )
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
-            return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
+            logits: torch.Tensor | list[torch.Tensor] = [
+                clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)
+            ]
         else:
-            return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+            logits = clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+
+        if return_self_state:
+            if self_state is None:
+                raise ValueError("return_self_state=True requires config.self_state_dim > 0")
+            return logits, self_state
+        return logits
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -304,6 +342,53 @@ class GPT(nn.Module):
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
+
+
+class SelfStateCell(nn.Module):
+    """Gated self-state update and residual injection used between Transformer blocks.
+
+    After each block:
+        new_state = encoder(activations)
+        gate = σ(W [old_state; new_state])
+        self_state = gate ⊙ old_state + (1 - gate) ⊙ new_state
+
+    The updated state is projected back to the model width and added to the
+    residual stream of the *next* block: ``next_input = activations + proj(self_state)``.
+    """
+
+    def __init__(self, n_embd: int, state_dim: int) -> None:
+        super().__init__()
+        hidden = max(state_dim * 2, 64)
+        self.encoder = nn.Sequential(
+            nn.Linear(n_embd, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, state_dim),
+        )
+        self.gate = nn.Linear(state_dim * 2, state_dim)
+        self.proj = nn.Linear(state_dim, n_embd)
+        # Zero-init the residual projection so training starts as a vanilla GPT.
+        nn.init.zeros_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def reset_parameters(self) -> None:
+        for module in self.encoder:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.normal_(self.gate.weight, mean=0.0, std=0.02)
+        if self.gate.bias is not None:
+            nn.init.zeros_(self.gate.bias)
+        nn.init.zeros_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, activations: torch.Tensor, self_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        new_state = self.encoder(activations)
+        gate = torch.sigmoid(self.gate(torch.cat([self_state, new_state], dim=-1)))
+        self_state = gate * self_state + (1.0 - gate) * new_state
+        return self_state, self.proj(self_state)
 
 
 class Block(nn.Module):
